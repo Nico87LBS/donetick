@@ -14,6 +14,7 @@ import (
 
 var ErrInsufficientPoints = errors.New("insufficient points balance")
 var ErrRedemptionNotPending = errors.New("redemption is not pending")
+var ErrQuotaReached = errors.New("reward quota reached for this period")
 
 type RewardRepository struct {
 	db *gorm.DB
@@ -47,10 +48,13 @@ func (r *RewardRepository) UpdateReward(ctx context.Context, reward *rModel.Rewa
 	return r.db.WithContext(ctx).Model(&rModel.Reward{}).
 		Where("id = ? AND circle_id = ?", reward.ID, reward.CircleID).
 		Updates(map[string]interface{}{
-			"name":        reward.Name,
-			"description": reward.Description,
-			"points_cost": reward.PointsCost,
-			"is_active":   reward.IsActive,
+			"name":           reward.Name,
+			"description":    reward.Description,
+			"points_cost":    reward.PointsCost,
+			"is_active":      reward.IsActive,
+			"quota_count":    reward.QuotaCount,
+			"quota_period":   reward.QuotaPeriod,
+			"quota_timezone": reward.QuotaTimezone,
 		}).Error
 }
 
@@ -74,6 +78,20 @@ func (r *RewardRepository) RequestRedemption(ctx context.Context, rewardID int, 
 		if err := tx.Where("user_id = ? AND circle_id = ?", userID, circleID).First(&member).Error; err != nil {
 			return err
 		}
+
+		if reward.HasQuota() {
+			start, _ := reward.QuotaWindow(time.Now().UTC())
+			var used int64
+			if err := tx.Model(&rModel.RewardRedemption{}).
+				Where("reward_id = ? AND user_id = ? AND status <> ? AND requested_at >= ?", reward.ID, userID, rModel.RedemptionStatusRejected, start).
+				Count(&used).Error; err != nil {
+				return err
+			}
+			if int(used) >= reward.QuotaCount {
+				return ErrQuotaReached
+			}
+		}
+
 		available := member.Points - member.PointsRedeemed
 		if available < reward.PointsCost {
 			return ErrInsufficientPoints
@@ -188,4 +206,31 @@ func (r *RewardRepository) GetRedemptionsByUser(ctx context.Context, userID int,
 		return nil, err
 	}
 	return redemptions, nil
+}
+
+// FillQuotaUsage sets QuotaUsed and QuotaResetsAt on each reward with a
+// quota, counting pending and approved redemptions in the current period.
+func (r *RewardRepository) FillQuotaUsage(ctx context.Context, circleID int, rewards []*rModel.Reward, now time.Time) error {
+	for _, reward := range rewards {
+		if !reward.HasQuota() {
+			continue
+		}
+		start, end := reward.QuotaWindow(now)
+		var rows []struct {
+			UserID int
+			Used   int
+		}
+		if err := r.db.WithContext(ctx).Model(&rModel.RewardRedemption{}).
+			Select("user_id, count(*) as used").
+			Where("reward_id = ? AND circle_id = ? AND status <> ? AND requested_at >= ?", reward.ID, circleID, rModel.RedemptionStatusRejected, start).
+			Group("user_id").Scan(&rows).Error; err != nil {
+			return err
+		}
+		reward.QuotaUsed = map[int]int{}
+		for _, row := range rows {
+			reward.QuotaUsed[row.UserID] = row.Used
+		}
+		reward.QuotaResetsAt = &end
+	}
+	return nil
 }

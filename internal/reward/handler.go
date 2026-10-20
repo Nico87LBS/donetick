@@ -26,6 +26,32 @@ type RewardReq struct {
 	Description string `json:"description"`
 	PointsCost  int    `json:"pointsCost" binding:"required,gt=0"`
 	IsActive    *bool  `json:"isActive"`
+	QuotaCount  int    `json:"quotaCount" binding:"gte=0"`
+	QuotaPeriod string `json:"quotaPeriod"`
+}
+
+// quota returns the reward's quota fields from the request, or an error
+// message when they are inconsistent.
+func (req RewardReq) quota() (int, string, string) {
+	if req.QuotaCount == 0 {
+		return 0, "", ""
+	}
+	if !rModel.ValidQuotaPeriod(req.QuotaPeriod) {
+		return 0, "", "quotaPeriod must be day, week or month"
+	}
+	return req.QuotaCount, req.QuotaPeriod, ""
+}
+
+func redemptionError(c *gin.Context, err error) bool {
+	switch err {
+	case rRepo.ErrInsufficientPoints:
+		c.JSON(400, gin.H{"error": "Not enough points to redeem this reward"})
+	case rRepo.ErrQuotaReached:
+		c.JSON(400, gin.H{"error": "This reward has already been redeemed as many times as allowed for this period"})
+	default:
+		return false
+	}
+	return true
 }
 
 type RedeemReq struct {
@@ -115,6 +141,9 @@ func (h *Handler) getRewards(c *gin.Context) {
 		return
 	}
 	rewards, err := h.rRepo.GetRewardsByCircle(c, currentUser.CircleID)
+	if err == nil {
+		err = h.rRepo.FillQuotaUsage(c, currentUser.CircleID, rewards, time.Now().UTC())
+	}
 	if err != nil {
 		logging.FromContext(c).Error("Failed to fetch rewards", "error", err)
 		c.JSON(500, gin.H{"error": "Error getting rewards"})
@@ -151,13 +180,22 @@ func (h *Handler) createReward(c *gin.Context) {
 		isActive = *req.IsActive
 	}
 
+	quotaCount, quotaPeriod, quotaErr := req.quota()
+	if quotaErr != "" {
+		c.JSON(400, gin.H{"error": quotaErr})
+		return
+	}
+
 	reward := &rModel.Reward{
-		CircleID:    currentUser.CircleID,
-		Name:        req.Name,
-		Description: req.Description,
-		PointsCost:  req.PointsCost,
-		IsActive:    isActive,
-		CreatedBy:   currentUser.ID,
+		CircleID:      currentUser.CircleID,
+		Name:          req.Name,
+		Description:   req.Description,
+		PointsCost:    req.PointsCost,
+		IsActive:      isActive,
+		CreatedBy:     currentUser.ID,
+		QuotaCount:    quotaCount,
+		QuotaPeriod:   quotaPeriod,
+		QuotaTimezone: currentUser.Timezone,
 	}
 	if err := h.rRepo.CreateReward(c, reward); err != nil {
 		c.JSON(500, gin.H{"error": "Error creating reward"})
@@ -200,13 +238,22 @@ func (h *Handler) updateReward(c *gin.Context) {
 		isActive = *req.IsActive
 	}
 
+	quotaCount, quotaPeriod, quotaErr := req.quota()
+	if quotaErr != "" {
+		c.JSON(400, gin.H{"error": quotaErr})
+		return
+	}
+
 	reward := &rModel.Reward{
-		ID:          id,
-		CircleID:    currentUser.CircleID,
-		Name:        req.Name,
-		Description: req.Description,
-		PointsCost:  req.PointsCost,
-		IsActive:    isActive,
+		ID:            id,
+		CircleID:      currentUser.CircleID,
+		Name:          req.Name,
+		Description:   req.Description,
+		PointsCost:    req.PointsCost,
+		IsActive:      isActive,
+		QuotaCount:    quotaCount,
+		QuotaPeriod:   quotaPeriod,
+		QuotaTimezone: currentUser.Timezone,
 	}
 	if err := h.rRepo.UpdateReward(c, reward); err != nil {
 		c.JSON(500, gin.H{"error": "Error updating reward"})
@@ -269,8 +316,7 @@ func (h *Handler) redeemReward(c *gin.Context) {
 
 	redemption, err := h.rRepo.RequestRedemption(c, id, currentUser.ID, currentUser.CircleID, req.Note)
 	if err != nil {
-		if err == rRepo.ErrInsufficientPoints {
-			c.JSON(400, gin.H{"error": "Not enough points to redeem this reward"})
+		if redemptionError(c, err) {
 			return
 		}
 		logging.FromContext(c).Error("Failed to request redemption", "error", err)
@@ -303,8 +349,7 @@ func (h *Handler) redeemForMember(c *gin.Context, rewardID int, memberID int, ad
 
 	redemption, err := h.rRepo.RequestRedemption(c, rewardID, memberID, circleID, note)
 	if err != nil {
-		if err == rRepo.ErrInsufficientPoints {
-			c.JSON(400, gin.H{"error": "Not enough points to redeem this reward"})
+		if redemptionError(c, err) {
 			return
 		}
 		logging.FromContext(c).Error("Failed to request redemption for member", "error", err)

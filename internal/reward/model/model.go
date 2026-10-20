@@ -13,6 +13,16 @@ type Reward struct {
 	CreatedBy   int       `json:"createdBy" gorm:"column:created_by"`
 	CreatedAt   time.Time `json:"createdAt" gorm:"column:created_at"`
 	UpdatedAt   time.Time `json:"updatedAt" gorm:"column:updated_at"`
+	// QuotaCount caps how many times each member may redeem the reward per
+	// QuotaPeriod (day, week or month); 0 means no limit. Periods follow the
+	// calendar in QuotaTimezone, captured from the admin who saved the reward.
+	QuotaCount    int    `json:"quotaCount" gorm:"column:quota_count;default:0"`
+	QuotaPeriod   string `json:"quotaPeriod" gorm:"column:quota_period"`
+	QuotaTimezone string `json:"quotaTimezone" gorm:"column:quota_timezone"`
+	// Filled in when listing: redemptions per member in the current period
+	// and when that period ends.
+	QuotaUsed     map[int]int `json:"quotaUsed,omitempty" gorm:"-"`
+	QuotaResetsAt *time.Time  `json:"quotaResetsAt,omitempty" gorm:"-"`
 }
 
 type RedemptionStatus int8
