@@ -1527,6 +1527,7 @@ type ChildUserResponse struct {
 	DisplayName string `json:"displayName"`
 	UserType    string `json:"userType"`
 	CreatedAt   string `json:"createdAt"`
+	Image       string `json:"image,omitempty"`
 }
 
 func (h *Handler) createChildUser(c *gin.Context) {
@@ -1770,6 +1771,7 @@ func (h *Handler) getChildUsers(c *gin.Context) {
 			DisplayName: child.DisplayName,
 			UserType:    "child",
 			CreatedAt:   child.CreatedAt.Format(time.RFC3339),
+			Image:       h.signer.SignIfLocal(child.Image),
 		})
 	}
 
