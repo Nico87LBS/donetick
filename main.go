@@ -234,6 +234,7 @@ func main() {
 			thing.APIs,
 			label.Routes,
 			reward.Routes,
+			reward.APIs,
 			project.Routes,
 			filter.Routes,
 

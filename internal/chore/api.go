@@ -23,6 +23,7 @@ import (
 	chModel "donetick.com/core/internal/chore/model"
 	cRepo "donetick.com/core/internal/circle/repo"
 	pjRepo "donetick.com/core/internal/project/repo"
+	"donetick.com/core/internal/storage"
 	stRepo "donetick.com/core/internal/subtask/repo"
 	uRepo "donetick.com/core/internal/user/repo"
 )
@@ -36,9 +37,11 @@ type API struct {
 	eventProducer *events.EventsProducer
 	stRepo        *stRepo.SubTasksRepository
 	pjRepo        *pjRepo.ProjectRepository
+	handler       *Handler
+	signer        storage.URLSigner
 }
 
-func NewAPI(cr *chRepo.ChoreRepository, userRepo *uRepo.UserRepository, circleRepo *cRepo.CircleRepository, nPlanner *nps.NotificationPlanner, nr *nRepo.NotificationRepository, eventProducer *events.EventsProducer, stRepo *stRepo.SubTasksRepository, pjRepo *pjRepo.ProjectRepository) *API {
+func NewAPI(cr *chRepo.ChoreRepository, userRepo *uRepo.UserRepository, circleRepo *cRepo.CircleRepository, nPlanner *nps.NotificationPlanner, nr *nRepo.NotificationRepository, eventProducer *events.EventsProducer, stRepo *stRepo.SubTasksRepository, pjRepo *pjRepo.ProjectRepository, handler *Handler, signer storage.URLSigner) *API {
 	return &API{
 		choreRepo:     cr,
 		userRepo:      userRepo,
@@ -48,6 +51,8 @@ func NewAPI(cr *chRepo.ChoreRepository, userRepo *uRepo.UserRepository, circleRe
 		eventProducer: eventProducer,
 		stRepo:        stRepo,
 		pjRepo:        pjRepo,
+		handler:       handler,
+		signer:        signer,
 	}
 }
 
@@ -348,6 +353,19 @@ func (h *API) CompleteChore(c *gin.Context) {
 		}
 	}
 
+	// A chore that requires approval waits for an admin, as it does in the app.
+	if chore.RequireApproval {
+		updatedChore, err := h.handler.submitForApproval(c, chore, nil, performer, completedDate, currentUser, currentUser, circleUsers)
+		if err != nil {
+			c.JSON(500, gin.H{
+				"error": err.Error(),
+			})
+			return
+		}
+		c.JSON(200, updatedChore)
+		return
+	}
+
 	var nextDueDate *time.Time
 	if chore.FrequencyType == "adaptive" {
 		history, err := h.choreRepo.GetChoreHistoryWithLimit(c, chore.ID, 5)
@@ -429,6 +447,9 @@ func (h *API) GetCircleMembers(c *gin.Context) {
 		c.JSON(404, gin.H{"error": "No members found in the circle"})
 		return
 	}
+	for i := range users {
+		users[i].Image = h.signer.SignIfLocal(users[i].Image)
+	}
 	c.JSON(200, users)
 }
 func (h *API) DeleteChore(c *gin.Context) {
@@ -488,6 +509,8 @@ func APIs(cfg *config.Config, api *API, r *gin.Engine, auth *jwt.GinJWTMiddlewar
 	{
 		tasksPlusAPI.POST("/:id/complete", api.CompleteChore)
 		tasksPlusAPI.PUT("/:id", api.UpdateChore)
+		tasksPlusAPI.POST("/:id/approve", api.handler.ApproveChore)
+		tasksPlusAPI.POST("/:id/reject", api.handler.RejectChore)
 	}
 
 	circleAPI := r.Group("eapi/v1/circle")

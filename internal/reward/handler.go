@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"time"
 
+	"donetick.com/core/config"
 	auth "donetick.com/core/internal/auth"
 	circle "donetick.com/core/internal/circle/model"
 	cRepo "donetick.com/core/internal/circle/repo"
@@ -12,9 +13,12 @@ import (
 	nRepo "donetick.com/core/internal/notifier/repo"
 	rModel "donetick.com/core/internal/reward/model"
 	rRepo "donetick.com/core/internal/reward/repo"
+	uRepo "donetick.com/core/internal/user/repo"
+	"donetick.com/core/internal/utils"
 	"donetick.com/core/logging"
 	jwt "github.com/appleboy/gin-jwt/v2"
 	"github.com/gin-gonic/gin"
+	limiter "github.com/ulule/limiter/v3"
 )
 
 type RewardReq struct {
@@ -26,6 +30,9 @@ type RewardReq struct {
 
 type RedeemReq struct {
 	Note *string `json:"note"`
+	// UserID lets an admin or manager redeem for another circle member, such
+	// as a child without a login. That redemption is approved at once.
+	UserID *int `json:"userId"`
 }
 
 type ResolveReq struct {
@@ -255,6 +262,11 @@ func (h *Handler) redeemReward(c *gin.Context) {
 	// body is optional (note is optional), so ignore binding errors on an empty body
 	_ = c.ShouldBindJSON(&req)
 
+	if req.UserID != nil && *req.UserID != currentUser.ID {
+		h.redeemForMember(c, id, *req.UserID, currentUser.ID, currentUser.CircleID, req.Note)
+		return
+	}
+
 	redemption, err := h.rRepo.RequestRedemption(c, id, currentUser.ID, currentUser.CircleID, req.Note)
 	if err != nil {
 		if err == rRepo.ErrInsufficientPoints {
@@ -272,6 +284,47 @@ func (h *Handler) redeemReward(c *gin.Context) {
 	}
 	h.notifyAdminsOfRedemptionRequest(c, currentUser.CircleID, requesterName, redemption)
 
+	c.JSON(200, gin.H{"res": redemption})
+}
+
+// redeemForMember spends a member's points on their behalf. Only an admin or
+// manager may do it, and since they would approve the request anyway, it is
+// recorded and approved in one go.
+func (h *Handler) redeemForMember(c *gin.Context, rewardID int, memberID int, adminID int, circleID int, note *string) {
+	isAdmin, err := h.isAdminOrManager(c, adminID, circleID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Error checking permissions"})
+		return
+	}
+	if !isAdmin {
+		c.JSON(403, gin.H{"error": "Only admins or managers can redeem for another member"})
+		return
+	}
+
+	redemption, err := h.rRepo.RequestRedemption(c, rewardID, memberID, circleID, note)
+	if err != nil {
+		if err == rRepo.ErrInsufficientPoints {
+			c.JSON(400, gin.H{"error": "Not enough points to redeem this reward"})
+			return
+		}
+		logging.FromContext(c).Error("Failed to request redemption for member", "error", err)
+		c.JSON(500, gin.H{"error": "Error requesting redemption"})
+		return
+	}
+
+	if err := h.rRepo.ApproveRedemption(c, redemption.ID, circleID, adminID); err != nil {
+		if err == rRepo.ErrInsufficientPoints {
+			c.JSON(400, gin.H{"error": "Not enough points to redeem this reward"})
+			return
+		}
+		logging.FromContext(c).Error("Failed to approve redemption for member", "error", err)
+		c.JSON(500, gin.H{"error": "Error approving redemption"})
+		return
+	}
+	now := time.Now().UTC()
+	redemption.Status = rModel.RedemptionStatusApproved
+	redemption.ResolvedAt = &now
+	redemption.ResolvedBy = &adminID
 	c.JSON(200, gin.H{"res": redemption})
 }
 
@@ -410,5 +463,26 @@ func Routes(r *gin.Engine, h *Handler, auth *jwt.GinJWTMiddleware) {
 		rewardRoutes.GET("/redemptions", h.getRedemptions)
 		rewardRoutes.POST("/redemptions/:id/approve", h.approveRedemption)
 		rewardRoutes.POST("/redemptions/:id/reject", h.rejectRedemption)
+	}
+}
+
+// APIs exposes rewards on the external API, authenticated with an API token
+// like the other eapi routes, so integrations such as Home Assistant can list
+// rewards and resolve redemptions.
+func APIs(cfg *config.Config, h *Handler, r *gin.Engine, limiter *limiter.Limiter, userRepo *uRepo.UserRepository) {
+	rewardAPI := r.Group("eapi/v1/rewards")
+	rewardAPI.Use(
+		utils.TimeoutMiddleware(cfg.Server.WriteTimeout),
+		utils.RateLimitMiddleware(limiter),
+		auth.APITokenMiddleware(userRepo),
+		auth.RequirePlusMemberMiddleware(),
+	)
+	{
+		rewardAPI.GET("", h.getRewards)
+		rewardAPI.POST("/:id/redeem", h.redeemReward)
+
+		rewardAPI.GET("/redemptions", h.getRedemptions)
+		rewardAPI.POST("/redemptions/:id/approve", h.approveRedemption)
+		rewardAPI.POST("/redemptions/:id/reject", h.rejectRedemption)
 	}
 }
