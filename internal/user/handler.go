@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1283,13 +1284,58 @@ func (h *Handler) updateProfilePhoto(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
 		return
 	}
+	h.saveProfilePhoto(c, currentUser.ID, currentUser.Image)
+}
 
+// updateChildProfilePhoto lets a parent set the photo of one of their child
+// accounts, which cannot sign in to do it themselves.
+func (h *Handler) updateChildProfilePhoto(c *gin.Context) {
+	currentUser, ok := auth.CurrentUser(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+
+	// Only parent users can update child photos
+	if currentUser.UserType != uModel.UserTypeParent {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only parent users can update child photos"})
+		return
+	}
+
+	childID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid child user ID"})
+		return
+	}
+
+	// Verify that the child user belongs to the current parent
+	childUser, err := h.userRepo.GetUserByID(c, childID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Child user not found"})
+		return
+	}
+	if childUser.ParentUserID == nil || *childUser.ParentUserID != currentUser.ID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can only update photos for your own child users"})
+		return
+	}
+
+	h.saveProfilePhoto(c, childUser.ID, childUser.Image)
+}
+
+// saveProfilePhoto stores the uploaded "file" as the profile photo of userID
+// and removes their previous locally stored photo.
+func (h *Handler) saveProfilePhoto(c *gin.Context, userID int, previousImage string) {
 	file, err := c.FormFile("file")
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid file"})
 		return
 	}
-	fileExtension := file.Filename[strings.LastIndex(file.Filename, "."):]
+	dot := strings.LastIndex(file.Filename, ".")
+	if dot < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid file extension"})
+		return
+	}
+	fileExtension := strings.ToLower(file.Filename[dot:])
 	// validate file extension:
 	if fileExtension != ".jpg" && fileExtension != ".jpeg" && fileExtension != ".png" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid file extension"})
@@ -1300,9 +1346,9 @@ func (h *Handler) updateProfilePhoto(c *gin.Context) {
 	// the username — this matters when the bucket is configured for public
 	// reads (storage.public_read: true) and the URL is served unsigned.
 	// UPDATE: we add back userID but kept the UUID to avoid collisions and make it unguessable.
-	// the currentUser.ID help managing the storage usage for each user
+	// the user ID help managing the storage usage for each user
 
-	filename := fmt.Sprintf("profiles/%d/%s%s", currentUser.ID, uuid.New().String(), fileExtension)
+	filename := fmt.Sprintf("profiles/%d/%s%s", userID, uuid.New().String(), fileExtension)
 
 	openedFile, err := file.Open()
 	if err != nil {
@@ -1330,7 +1376,7 @@ func (h *Handler) updateProfilePhoto(c *gin.Context) {
 	// Clean up the previous profile photo when it is a locally-stored path.
 	// Full https:// URLs (OIDC picture claims or public-bucket URLs) are
 	// skipped — public-bucket objects accumulate until a future cleanup pass.
-	if prev := currentUser.Image; prev != "" &&
+	if prev := previousImage; prev != "" &&
 		!strings.HasPrefix(prev, "http://") &&
 		!strings.HasPrefix(prev, "https://") {
 		// Legacy rows stored the storage base directory in the path
@@ -1344,7 +1390,7 @@ func (h *Handler) updateProfilePhoto(c *gin.Context) {
 		}
 	}
 
-	err = h.userRepo.UpdateUserImage(c, currentUser.ID, photoURL)
+	err = h.userRepo.UpdateUserImage(c, userID, photoURL)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update profile photo"})
 		return
@@ -1833,6 +1879,7 @@ func Routes(router *gin.Engine, h *Handler, jwtAuth *jwt.GinJWTMiddleware, multi
 		userRoutes.GET("/subaccounts", h.getChildUsers)
 		userRoutes.PUT("/subaccounts/password", h.updateChildPassword)
 		userRoutes.DELETE("/subaccounts/:id", h.deleteChildUser)
+		userRoutes.POST("/subaccounts/:id/profile_photo", h.updateChildProfilePhoto)
 	}
 
 	// Create new auth handler for enhanced token management

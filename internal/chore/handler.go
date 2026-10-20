@@ -2468,40 +2468,13 @@ func (h *Handler) CompleteChore(c *gin.Context) {
 
 	// Check if chore requires approval
 	if chore.RequireApproval {
-		// Set chore status to pending approval instead of completing
-		if err := h.choreRepo.SetChorePendingApproval(c, chore, note, completedBy, &completedDate); err != nil {
-			c.JSON(500, gin.H{
-				"error": "Error setting chore pending approval",
-			})
-			return
-		}
-
-		updatedChore, err := h.choreRepo.GetChore(c, id, effectiveUser.ID, actualUser.CircleID)
+		updatedChore, err := h.submitForApproval(c, chore, note, completedBy, completedDate, actualUser, effectiveUser, circleUsers)
 		if err != nil {
 			c.JSON(500, gin.H{
-				"error": "Error getting chore",
+				"error": err.Error(),
 			})
 			return
 		}
-
-		// Broadcast pending approval event
-		if h.realTimeService != nil {
-			broadcaster := h.realTimeService.GetEventBroadcaster()
-			changes := map[string]interface{}{
-				"status":    chModel.ChoreStatusPendingApproval,
-				"updatedBy": actualUser.ID, // Use actual user for audit trail
-				"updatedAt": time.Now().UTC(),
-			}
-			broadcaster.BroadcastChoreUpdated(updatedChore, &effectiveUser.User, changes, note)
-		}
-
-		h.notifyApproversOfPendingApproval(c, chore, &effectiveUser.User, circleUsers)
-
-		completerName := effectiveUser.DisplayName
-		if completerName == "" {
-			completerName = effectiveUser.Username
-		}
-		h.notifyAdminsOfPendingApproval(c, actualUser.CircleID, completerName, updatedChore)
 
 		c.JSON(200, gin.H{
 			"res":     updatedChore,
@@ -3563,6 +3536,55 @@ func (h *Handler) DeleteTimeSession(c *gin.Context) {
 
 		return
 	}
+}
+
+// submitForApproval records a completion as pending instead of completing the
+// chore, then tells the approvers. It is shared by the app route and the
+// external API so a chore that requires approval behaves the same from both.
+// Notifications name the credited member (completedBy), which differs from the
+// submitter when an admin completes on someone's behalf.
+func (h *Handler) submitForApproval(c *gin.Context, chore *chModel.Chore, note *string, completedBy int, completedDate time.Time, actualUser, effectiveUser *uModel.UserDetails, circleUsers []*circle.UserCircleDetail) (*chModel.Chore, error) {
+	if err := h.choreRepo.SetChorePendingApproval(c, chore, note, completedBy, &completedDate); err != nil {
+		return nil, errors.New("Error setting chore pending approval")
+	}
+
+	updatedChore, err := h.choreRepo.GetChore(c, chore.ID, effectiveUser.ID, actualUser.CircleID)
+	if err != nil {
+		return nil, errors.New("Error getting chore")
+	}
+
+	// Broadcast pending approval event
+	if h.realTimeService != nil {
+		broadcaster := h.realTimeService.GetEventBroadcaster()
+		changes := map[string]interface{}{
+			"status":    chModel.ChoreStatusPendingApproval,
+			"updatedBy": actualUser.ID, // Use actual user for audit trail
+			"updatedAt": time.Now().UTC(),
+		}
+		broadcaster.BroadcastChoreUpdated(updatedChore, &effectiveUser.User, changes, note)
+	}
+
+	h.notifyApproversOfPendingApproval(c, chore, &effectiveUser.User, circleUsers)
+
+	completerName := effectiveUser.DisplayName
+	if completerName == "" {
+		completerName = effectiveUser.Username
+	}
+	if completedBy != effectiveUser.ID {
+		for _, member := range circleUsers {
+			if member.UserID != completedBy {
+				continue
+			}
+			if member.DisplayName != "" {
+				completerName = member.DisplayName
+			} else if member.Username != "" {
+				completerName = member.Username
+			}
+			break
+		}
+	}
+	h.notifyAdminsOfPendingApproval(c, actualUser.CircleID, completerName, updatedChore)
+	return updatedChore, nil
 }
 
 // notifyAdminsOfPendingApproval fans out one Notification row per admin/manager's
